@@ -18,7 +18,7 @@
   #chg { font-size: 12px; margin-left: 6px; }
   #wrap { position: relative; flex: 1; min-height: 0; }
   #chart { position: absolute; inset: 0; }
-  #ov { position: absolute; top: 0; left: 0; touch-action: none; pointer-events: none; }
+  #ov { position: absolute; top: 0; left: 0; touch-action: none; pointer-events: none; -webkit-user-select: none; user-select: none; }
   #status { font-size: 12px; color: var(--dim); padding: 4px 10px; background: var(--panel); border-top: 1px solid var(--line); min-height: 24px; }
   :root[data-theme="light"] { --bg:#ffffff; --panel:#f8f9fd; --line:#e0e3eb; --text:#131722; --dim:#6a7080; --up:#089981; --down:#f23645; --accent:#d08a00; }
   :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
@@ -57,7 +57,7 @@ const LC = LightweightCharts;
 const $ = id => document.getElementById(id);
 const TFS = ['1m','5m','15m','1h','4h','1d','1w'];
 let sym = 'BTCUSDT', tf = '1h', ws = null, wsTok = 0, candles = [], tIdx = new Map();
-let drawings = [], draft = null, dragStart = null, tool = 'pan', baseStatus = '';
+let drawings = [], draft = null, isDragging = false, firstPos = null, tool = 'pan', baseStatus = '';
 
 /* ---------- chart ---------- */
 const chart = LC.createChart($('chart'), {
@@ -83,6 +83,13 @@ const mSig  = chart.addSeries(LC.LineSeries, { color:'#e0b04a', lineWidth:1, pri
 
 function sizePanes() { try { const p = chart.panes(); p[1].setHeight(90); p[2].setHeight(90); } catch (e) {} }
 sizePanes();
+
+function setChartLocked(locked) {
+  chart.applyOptions({
+    handleScroll: { mouseWheel: !locked, pressedMouseMove: !locked, horzTouchDrag: !locked, vertTouchDrag: !locked },
+    handleScale: { mouseWheel: !locked, pinch: !locked, axisPressedMouseMove: !locked, axisDoubleClickReset: !locked }
+  });
+}
 
 /* ---------- indicator math ---------- */
 function emaVals(v, n) { const k = 2/(n+1), o = []; let p; v.forEach((x,i) => { p = i ? x*k + p*(1-k) : x; o.push(p); }); return o; }
@@ -181,7 +188,7 @@ const yOf = p => cs.priceToCoordinate(p);
 
 function line(x1,y1,x2,y2,c,w=1,dash=[]) { cx.beginPath(); cx.setLineDash(dash); cx.strokeStyle = c; cx.lineWidth = w; cx.moveTo(x1,y1); cx.lineTo(x2,y2); cx.stroke(); cx.setLineDash([]); }
 function txt(s,x,y,c,al='left') { cx.font = '11px system-ui, sans-serif'; cx.fillStyle = c; cx.textAlign = al; cx.fillText(s,x,y); }
-function dot(x,y,c) { cx.beginPath(); cx.fillStyle = c; cx.arc(x,y,3.5,0,6.3); cx.fill(); }
+function dot(x,y,c) { cx.beginPath(); cx.fillStyle = c; cx.arc(x,y,4,0,Math.PI*2); cx.fill(); }
 
 function res(pt) {
   if (!pt || pt.t === undefined) return null;
@@ -196,7 +203,7 @@ const FIBC = ['#8a93a3','#f0506e','#e0b04a','#2ebd85','#5aa9e6','#b57edc','#8a93
 function drawOne(d, R) {
   if (d.type === 'hline') {
     const y = yOf(d.a.p); if (y == null) return;
-    line(0,y,R,y,'#e0b04a',1,[6,4]); txt(fmt(d.a.p), R-4, y-4, '#e0b04a', 'right'); return;
+    line(0,y,R,y,'#e0b04a',1.5,[6,4]); txt(fmt(d.a.p), R-4, y-4, '#e0b04a', 'right'); return;
   }
   const A = res(d.a), B = res(d.b); if (!A || !B) return;
   if (d.type === 'trend') { line(A.x,A.y,B.x,B.y,'#5aa9e6',2); dot(A.x,A.y,'#5aa9e6'); dot(B.x,B.y,'#5aa9e6'); }
@@ -264,41 +271,97 @@ function frameBody() {
 requestAnimationFrame(frame);
 
 /* ---------- drawing input ---------- */
-const HINTS = { trend:'Trendline: tap the start, then the end (or drag)', hline:'Tap to place a horizontal line', fib:'Fib: tap the swing start, then the swing end', vp:'Volume profile: tap the range start, then the range end' };
+const HINTS = {
+  trend: 'Trendline: tap/drag start point, then tap end point',
+  hline: 'Tap inside chart to place a horizontal line',
+  fib:   'Fib: tap/drag swing start, then tap swing end',
+  vp:    'Vol profile: tap/drag range start, then tap range end'
+};
+
 function setTool(t) {
-  tool = t; draft = null; dragStart = null;
+  tool = t; draft = null; isDragging = false; firstPos = null;
   document.querySelectorAll('[data-tool]').forEach(b => b.classList.toggle('on', b.dataset.tool === t));
   cv.style.pointerEvents = t === 'pan' ? 'none' : 'auto';
+  setChartLocked(t !== 'pan');
   hint(HINTS[t]);
 }
-function ptFrom(e) {
-  const l = chart.timeScale().coordinateToLogical(e.offsetX), p = cs.coordinateToPrice(e.offsetY);
-  if (l == null || p == null || !candles.length) return null;
-  const i = Math.max(0, Math.min(candles.length-1, Math.round(l)));
-  return { t:candles[i].time, o:l-i, p };
-}
-function commit(d) { drawings.push(d); draft = null; dragStart = null; saveDrawings(); setTool('pan'); }
 
-let firstPos = null;
+function localXY(e) {
+  const rect = cv.getBoundingClientRect();
+  return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+}
+
+function ptFromXY(x, y) {
+  if (x < 0 || y < 0 || x > cv.clientWidth - axisW() || y > paneH()) return null;
+  const l = chart.timeScale().coordinateToLogical(x);
+  const p = cs.coordinateToPrice(y);
+  if (l == null || p == null || !Number.isFinite(p) || !candles.length) return null;
+  const i = Math.max(0, Math.min(candles.length - 1, Math.round(l)));
+  return { t: candles[i].time, o: l - i, p };
+}
+
+function commit(d) {
+  drawings.push(d);
+  draft = null;
+  isDragging = false;
+  firstPos = null;
+  saveDrawings();
+  setTool('pan');
+}
+
 cv.addEventListener('pointerdown', e => {
-  if (tool === 'pan' || e.offsetX > cv.clientWidth - axisW()) return;
-  const pt = ptFrom(e); if (!pt) { hint('Tap inside the chart area'); return; }
+  if (tool === 'pan') return;
+  const { x, y } = localXY(e);
+  if (x > cv.clientWidth - axisW() || y > paneH()) {
+    hint('Tap inside the main candle chart area');
+    return;
+  }
+  const pt = ptFromXY(x, y);
+  if (!pt) { hint('Tap inside the chart area'); return; }
   e.preventDefault();
   try { cv.setPointerCapture(e.pointerId); } catch (err) {}
-  if (tool === 'hline') { commit({ type:'hline', a:pt }); return; }
-  if (!draft) {
-    draft = { type:tool, a:pt, b:pt };
-    firstPos = { x:e.offsetX, y:e.offsetY }; dragStart = { x:e.offsetX, y:e.offsetY };
-    hint('Now tap the end point (a bit away from the first one)');
+
+  if (tool === 'hline') {
+    commit({ type: 'hline', a: pt });
+    return;
   }
-  else if (Math.hypot(e.offsetX - firstPos.x, e.offsetY - firstPos.y) < 12) { hint('Tap further away to set the end point'); }
-  else { draft.b = pt; commit(draft); }
+
+  if (!draft) {
+    draft = { type: tool, a: pt, b: pt };
+    firstPos = { x, y };
+    isDragging = true;
+    hint('Drag or tap second point to finish');
+  } else {
+    if (Math.hypot(x - firstPos.x, y - firstPos.y) < 10) {
+      hint('Tap a little further away to set the end point');
+      return;
+    }
+    draft.b = pt;
+    commit(draft);
+  }
 });
-cv.addEventListener('pointermove', e => { if (!draft) return; const pt = ptFrom(e); if (pt) draft.b = pt; });
+
+cv.addEventListener('pointermove', e => {
+  if (!draft) return;
+  const { x, y } = localXY(e);
+  const pt = ptFromXY(x, y);
+  if (pt) draft.b = pt;
+});
+
 cv.addEventListener('pointerup', e => {
-  if (!draft || !dragStart) return;
-  if (Math.hypot(e.offsetX - dragStart.x, e.offsetY - dragStart.y) > 14) { const pt = ptFrom(e); if (pt) draft.b = pt; commit(draft); }
-  dragStart = null;
+  if (!draft || !isDragging || !firstPos) return;
+  const { x, y } = localXY(e);
+  isDragging = false;
+  // If user dragged meaningfully (> 18px), finish on release; otherwise wait for second tap
+  if (Math.hypot(x - firstPos.x, y - firstPos.y) > 18) {
+    const pt = ptFromXY(x, y);
+    if (pt) {
+      draft.b = pt;
+      commit(draft);
+    }
+  } else {
+    hint('Now tap the second point');
+  }
 });
 
 /* ---------- UI ---------- */
@@ -336,3 +399,5 @@ load();
 </script>
 </body>
 </html>
+
+
